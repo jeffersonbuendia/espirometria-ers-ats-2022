@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Datos clínicos: NUNCA deben versionarse.
+# Los reportes espirométricos contienen datos personales y de salud.
+*.pdf
+!docs/**/*.pdf
+datos/
+pacientes/
+muestras/
+
+# Sistema y editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Streamlit
+.streamlit/secrets.toml
