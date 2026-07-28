@@ -1,0 +1,310 @@
+"""
+Pruebas del motor de interpretación.
+
+Cubren los siete patrones ventilatorios del ERS/ATS 2022, la gradación de
+severidad por z-score, el criterio de respuesta broncodilatadora del 10 % del
+predicho y los casos límite en los que el estándar exige abstenerse de
+clasificar.
+"""
+
+import pytest
+
+from informe_espirometria import EstandaresERS2022
+from interpretation import (
+    bronchodilator_details,
+    bronchodilator_response,
+    classify_pattern,
+    effective_z,
+    generate_conclusion,
+    is_low,
+    severity_from_fev1_zscore,
+)
+from models import LungVolumes, PatientData, SpirometryValue
+
+
+def value(parameter, unit="L", **kwargs):
+    return SpirometryValue(parameter=parameter, unit=unit, **kwargs)
+
+
+def build(ratio, fvc, fev1):
+    """Construye el trío de parámetros a partir de tuplas (basal, pred, lln, post)."""
+    def make(name, unit, datos):
+        basal, pred, lln, post = datos
+        return value(name, unit=unit, baseline=basal, predicted=pred,
+                     lln=lln, post=post)
+    return {
+        "FEV1/FVC": make("FEV1/FVC", "%", ratio),
+        "FVC": make("FVC", "L", fvc),
+        "FEV1": make("FEV1", "L", fev1),
+    }
+
+
+ADULTO = PatientData(name="Adulto", age_years=60.0, sex="Masculino",
+                     height_cm=170.0, weight_kg=70.0)
+NINO = PatientData(name="Niño", age_years=10.0, sex="Femenino",
+                   height_cm=140.0, weight_kg=35.0)
+
+
+# ---------------------------------------------------------------- z-score
+def test_z_estimado_coincide_con_lin():
+    """En el LIN exacto el z estimado debe ser -1,645."""
+    assert EstandaresERS2022.z_desde_lln(2.30, 2.84, 2.30) == pytest.approx(-1.645)
+
+
+def test_z_suministrado_tiene_prioridad_sobre_el_estimado():
+    v = value("FEV1", baseline=2.00, predicted=3.00, lln=2.40, z_score=-1.10)
+    assert effective_z(v) == -1.10
+
+
+def test_is_low_usa_el_zscore_como_criterio_primario():
+    v = value("FEV1", baseline=2.00, predicted=3.00, lln=2.40, z_score=-1.10)
+    assert is_low(v) is False
+
+
+# --------------------------------------------------------------- severidad
+@pytest.mark.parametrize("z,esperado", [
+    (0.5, "sin reducción"),
+    (-1.60, "sin reducción"),
+    (-2.00, "leve"),
+    (-3.50, "moderada"),
+    (-4.50, "grave"),
+    (None, "no clasificable"),
+])
+def test_severidad_por_zscore(z, esperado):
+    assert severity_from_fev1_zscore(z) == esperado
+
+
+# ----------------------------------------------------------------- patrones
+def test_patron_normal():
+    valores = build(ratio=(79.0, 78.0, 68.0, None),
+                    fvc=(4.30, 4.20, 3.40, None),
+                    fev1=(3.40, 3.30, 2.60, None))
+    assert classify_pattern(valores).etiqueta == "Normal"
+
+
+def test_patron_obstructivo():
+    valores = build(ratio=(55.0, 78.0, 68.0, None),
+                    fvc=(4.00, 4.20, 3.40, None),
+                    fev1=(2.20, 3.30, 2.60, None))
+    assert classify_pattern(valores).etiqueta == "Obstructivo"
+
+
+def test_patron_mixto_requiere_volumenes_sin_tlc():
+    valores = build(ratio=(59.6, 78.0, 68.0, None),
+                    fvc=(2.60, 4.20, 3.40, None),
+                    fev1=(1.55, 3.30, 2.60, None))
+    patron = classify_pattern(valores)
+    assert patron.etiqueta == "Mixto (sospecha)"
+    assert patron.requiere_volumenes is True
+
+
+def test_patron_mixto_confirmado_con_tlc_baja():
+    valores = build(ratio=(59.6, 78.0, 68.0, None),
+                    fvc=(2.60, 4.20, 3.40, None),
+                    fev1=(1.55, 3.30, 2.60, None))
+    volumenes = LungVolumes(tlc=4.60, tlc_predicted=6.40, tlc_lln=5.10)
+    assert classify_pattern(valores, volumes=volumenes).etiqueta == "Mixto"
+
+
+def test_cociente_bajo_con_tlc_normal_es_atrapamiento_no_restriccion():
+    valores = build(ratio=(59.6, 78.0, 68.0, None),
+                    fvc=(2.60, 4.20, 3.40, None),
+                    fev1=(1.55, 3.30, 2.60, None))
+    volumenes = LungVolumes(tlc=7.20, tlc_predicted=6.40, tlc_lln=5.10)
+    patron = classify_pattern(valores, volumes=volumenes)
+    assert patron.etiqueta == "Obstructivo con atrapamiento aéreo"
+
+
+def test_patron_restrictivo_confirmado():
+    valores = build(ratio=(84.6, 78.0, 68.0, None),
+                    fvc=(2.60, 4.20, 3.40, None),
+                    fev1=(2.20, 3.30, 2.60, None))
+    volumenes = LungVolumes(tlc=4.30, tlc_predicted=6.40, tlc_lln=5.10)
+    assert classify_pattern(valores, volumes=volumenes).etiqueta == "Restrictivo"
+
+
+def test_prism_sin_volumenes():
+    valores = build(ratio=(81.7, 78.0, 68.0, None),
+                    fvc=(3.00, 4.20, 3.40, None),
+                    fev1=(2.45, 3.30, 2.60, None))
+    patron = classify_pattern(valores)
+    assert patron.etiqueta == "Posible restricción / PRISm"
+    assert patron.requiere_volumenes is True
+
+
+def test_patron_inespecifico_con_tlc_normal():
+    valores = build(ratio=(81.7, 78.0, 68.0, None),
+                    fvc=(3.00, 4.20, 3.40, None),
+                    fev1=(2.45, 3.30, 2.60, None))
+    volumenes = LungVolumes(tlc=5.90, tlc_predicted=6.40, tlc_lln=5.10)
+    assert classify_pattern(valores, volumes=volumenes).etiqueta == "Patrón inespecífico"
+
+
+def test_disanapsis():
+    valores = build(ratio=(63.9, 78.0, 68.0, None),
+                    fvc=(5.40, 4.20, 3.40, None),
+                    fev1=(3.45, 3.30, 2.60, None))
+    assert classify_pattern(valores).etiqueta == "Disanapsis"
+
+
+def test_patron_no_clasificable_sin_referencia_del_cociente():
+    valores = {
+        "FEV1/FVC": value("FEV1/FVC", unit="%", baseline=70.0),
+        "FVC": value("FVC", baseline=3.00, predicted=4.20, lln=3.40),
+        "FEV1": value("FEV1", baseline=2.10, predicted=3.30, lln=2.60),
+    }
+    assert classify_pattern(valores).etiqueta == "No clasificable"
+
+
+def test_el_patron_se_clasifica_sobre_los_valores_post_bd():
+    """Pre-BD obstructivo que se normaliza tras el broncodilatador."""
+    valores = build(ratio=(63.1, 79.0, 69.5, 71.0),
+                    fvc=(3.58, 3.72, 3.04, 3.64),
+                    fev1=(2.26, 2.95, 2.24, 2.60))
+    patron = classify_pattern(valores)
+    assert patron.base == "post-BD"
+    assert patron.etiqueta == "Normal"
+    assert classify_pattern(valores, force_baseline=True).etiqueta == "Obstructivo"
+
+
+# ------------------------------------------------------------------- BDR
+def test_bdr_positiva_por_criterio_2022():
+    valores = build(ratio=(55.0, 78.0, 68.0, 60.0),
+                    fvc=(2.10, 4.20, 3.40, 2.90),
+                    fev1=(0.95, 3.30, 2.60, 1.60))
+    positiva, texto = bronchodilator_response(valores, ADULTO)
+    assert positiva is True
+    assert "FEV1" in texto
+
+
+def test_bdr_negativa_2022_pero_positiva_con_el_criterio_antiguo():
+    """
+    Caso real: FEV1 2,26 -> 2,54 L con predicho 2,95.
+    +12,4 % del basal y +280 mL cumplían el criterio de 2005, pero el cambio
+    es sólo el 9,5 % del predicho, por lo que el criterio vigente lo declara
+    negativo. Es la discrepancia que el informe debe hacer explícita.
+    """
+    valores = build(ratio=(63.1, 79.0, 69.5, 69.8),
+                    fvc=(3.58, 3.72, 3.04, 3.64),
+                    fev1=(2.26, 2.95, 2.24, 2.54))
+    detalle = bronchodilator_details(valores, ADULTO)
+    assert detalle["positive_2022"] is False
+    assert detalle["positive_2005"] is True
+    positiva, texto = bronchodilator_response(valores, ADULTO)
+    assert positiva is False
+    assert "ATS/ERS 2005" in texto
+
+
+def test_bdr_guarda_el_cambio_como_porcentaje_del_predicho():
+    valores = build(ratio=(55.0, 78.0, 68.0, 60.0),
+                    fvc=(2.10, 4.20, 3.40, 2.90),
+                    fev1=(0.95, 3.30, 2.60, 1.60))
+    bronchodilator_details(valores, ADULTO)
+    assert valores["FEV1"].percent_change_predicted == pytest.approx(19.7, abs=0.1)
+
+
+def test_bdr_pediatrica_usa_umbral_propio():
+    valores = build(ratio=(85.0, 88.0, 80.0, 88.0),
+                    fvc=(2.00, 2.20, 1.80, 2.10),
+                    fev1=(1.70, 1.90, 1.55, 1.88))
+    detalle = bronchodilator_details(valores, NINO)
+    assert detalle["paediatric"] is True
+    assert detalle["positive_paediatric"] is True   # +9,5 % del predicho
+    assert detalle["positive_2022"] is False        # no supera el 10 %
+
+
+def test_bdr_sin_valores_post():
+    valores = build(ratio=(79.0, 78.0, 68.0, None),
+                    fvc=(4.30, 4.20, 3.40, None),
+                    fev1=(3.40, 3.30, 2.60, None))
+    positiva, texto = bronchodilator_response(valores, ADULTO)
+    assert positiva is False
+    assert "posbroncodilatador" in texto
+
+
+# ------------------------------------------------------------- conclusión
+def test_conclusion_normal():
+    valores = build(ratio=(79.0, 78.0, 68.0, None),
+                    fvc=(4.30, 4.20, 3.40, None),
+                    fev1=(3.40, 3.30, 2.60, None))
+    assert "dentro de límites normales" in generate_conclusion(valores, ADULTO)
+
+
+def test_conclusion_pide_volumenes_cuando_hacen_falta():
+    valores = build(ratio=(81.7, 78.0, 68.0, None),
+                    fvc=(3.00, 4.20, 3.40, None),
+                    fev1=(2.45, 3.30, 2.60, None))
+    conclusion = generate_conclusion(valores, ADULTO)
+    assert "volúmenes pulmonares estáticos" in conclusion
+
+
+def test_conclusion_incluye_severidad_por_zscore():
+    valores = build(ratio=(45.0, 78.0, 68.0, None),
+                    fvc=(2.10, 4.20, 3.40, None),
+                    fev1=(0.95, 3.30, 2.60, None))
+    conclusion = generate_conclusion(valores, ADULTO)
+    assert "grave" in conclusion
+    assert "z del FEV1" in conclusion
+
+
+def test_conclusion_no_clasificable_es_explicita():
+    valores = {"FVC": value("FVC", baseline=3.00)}
+    assert "no clasificable" in generate_conclusion(valores, ADULTO)
+
+
+# -------------------------------------------------------------- calidad A-F
+@pytest.mark.parametrize("n,dif,esperado", [
+    (3, 0.10, "A"),
+    (2, 0.10, "B"),
+    (3, 0.18, "C"),
+    (3, 0.23, "D"),
+    (3, 0.40, "E"),
+])
+def test_gradacion_de_calidad(n, dif, esperado):
+    assert EstandaresERS2022.grado_calidad(n, dif)[0] == esperado
+
+
+def test_calidad_sin_maniobras_aceptables():
+    assert EstandaresERS2022.grado_calidad(0, None, n_utilizables=1)[0] == "U"
+    assert EstandaresERS2022.grado_calidad(0, None, n_utilizables=0)[0] == "F"
+
+
+def test_umbral_estricto_en_preescolares():
+    assert EstandaresERS2022.repetibilidad_estricta(5.0, 1.50) is True
+    assert EstandaresERS2022.repetibilidad_estricta(40.0, 0.95) is True
+    assert EstandaresERS2022.repetibilidad_estricta(40.0, 3.50) is False
+
+
+# ------------------------------------------------- vía aérea central/superior
+def test_indice_fev1_pef_detecta_obstruccion_central():
+    indice = EstandaresERS2022.indice_fev1_pef(fev1_L=2.80, pef_L_s=2.60)
+    assert indice > 8.0
+
+
+def test_indice_fev1_pef_normal():
+    indice = EstandaresERS2022.indice_fev1_pef(fev1_L=3.30, pef_L_s=8.00)
+    assert indice < 8.0
+
+
+# ------------------------------------------------------ cambio longitudinal
+def test_correlacion_longitudinal_reproduce_los_ejemplos_publicados():
+    """Varón de 14 años del ejemplo del estándar: r = 0,912 y r = 0,762."""
+    assert EstandaresERS2022.correlacion_longitudinal(
+        anios=0.25, edad_previa=14.0) == pytest.approx(0.912, abs=1e-3)
+    assert EstandaresERS2022.correlacion_longitudinal(
+        anios=4.0, edad_previa=14.0) == pytest.approx(0.762, abs=1e-3)
+
+
+def test_correlacion_longitudinal_se_abstiene_fuera_de_rango():
+    """
+    La expresión es lineal en la edad y supera la unidad en el adulto mayor,
+    lo que es imposible para una correlación. Debe devolver None en vez de
+    producir un resultado sin sentido.
+    """
+    assert EstandaresERS2022.correlacion_longitudinal(
+        anios=3.0, edad_previa=57.0) is None
+
+
+def test_delta_z_es_la_diferencia_simple():
+    assert EstandaresERS2022.delta_z(-0.40, -0.55) == pytest.approx(-0.15)
+    assert EstandaresERS2022.delta_z(None, -0.55) is None
